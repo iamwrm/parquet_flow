@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  merge_group:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Download public datasets
+        run: ./scripts/download-public-datasets.sh --all
+      - uses: mlugg/setup-zig@v2
+      - run: zig build test -Doptimize=ReleaseSafe -Dci-tests=true --summary all
