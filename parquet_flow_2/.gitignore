@@ -1,0 +1,6 @@
+local_data/
+ref/
+zig-out/
+zig-cache/
+.zig-cache/
+output/

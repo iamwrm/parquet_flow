@@ -1,0 +1,8 @@
+.{
+    .name = .parquet_flow,
+    .version = "0.1.0",
+    .fingerprint = 0xbfeb6e4742296190,
+    .minimum_zig_version = "0.14.0",
+    .paths = .{ "src", "build.zig", "build.zig.zon" },
+    .dependencies = .{},
+}
