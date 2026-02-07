@@ -1,0 +1,11 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-cache/
+
+# Local data (downloaded Zig compiler, benchmark output)
+local_data/
+
+# Parquet output files
+*.parquet
+output/
