@@ -12,15 +12,25 @@ From the original prompt:
 
 ---
 
-## parquet_flow_1 (Parzig-based, Zig 0.13)
+## Methodology
+
+All three implementations were built and benchmarked from source. Zig was bootstrapped via each project's `hooks/load_zig.sh`. Benchmarks run with `-Doptimize=ReleaseFast`. Output Parquet files validated with `pyarrow 23.0.0`. All numbers below are **measured**, not taken from READMEs.
+
+**Environment:** Linux x86_64, Zig 0.16.0-dev
+
+---
+
+## parquet_flow_1 (Pure Zig, Zig 0.16.0-dev.2490)
 
 ### Correctness
 
-**Parquet format:** Delegates to the `parzig` library, so format correctness is inherited from an existing implementation. The custom Thrift encoder (`compact.zig`) is correct: proper zigzag `(v << 1) ^ (0 - sign)`, field delta encoding, varint.
+**Build:** Compiles cleanly. **Tests pass.**
 
-**Writer (`writer.zig`):** Streams directly to file via buffered `std.Io.File.Writer` (128KB buffer). This is the only implementation that does streaming I/O rather than buffering the entire file in memory. Handles all 8 physical types with per-type validation. The level-aware path (`encodeLevelStreams`) correctly implements RLE encoding for definition/repetition levels.
+**Parquet format:** Custom Thrift encoder (`compact.zig`) with correct zigzag encoding, field delta encoding, varint. Streams directly to file via buffered `std.Io.File.Writer` (128KB buffer) -- the only implementation with streaming I/O. Handles all 8 physical types with per-type validation. Level-aware path (`encodeLevelStreams`) correctly implements RLE encoding for definition/repetition levels.
 
-**Ring buffer (`log_sink.zig`):** Slot-based queue with atomic `producer`/`consumer` indices. Memory ordering is correct. Uses condition variable signaling rather than spin-waiting.
+**Parquet validation:** Output files are **valid** -- pyarrow reads them correctly. Both the benchmark output (2M rows) and the log sink demo output (50K rows) pass validation.
+
+**Ring buffer (`log_sink.zig`):** Slot-based queue with atomic `producer`/`consumer` indices. Correct memory ordering. Uses condition variable signaling rather than spin-waiting. The log sink demo works end-to-end: 50K records written, 0 dropped.
 
 **Issues:**
 - The log sink hardcodes a single `byte_array` column schema, so it can only stream opaque blobs, not structured multi-column data.
@@ -37,27 +47,46 @@ This is the only implementation supporting `REPEATED` fields. Includes `pf_write
 
 **Weakness:** No streaming sink exported to C. The `LogSink` exists in Zig but isn't exposed in the C header.
 
-### Performance
+### Performance (Verified)
 
-- **Compression:** GZIP via `std.compress.flate` (implemented and working).
+- **Compression:** GZIP via `std.compress.flate` (working, validated by pyarrow).
 - **Streaming I/O:** Only implementation that writes directly to file, not buffering in memory.
 - **Scratch buffer reuse:** `scratch_page`, `scratch_compressed`, `scratch_header`, `scratch_levels` reused via `clearRetainingCapacity()`.
 - **Endianness fast path:** `encodeInt32Slice`/`encodeInt64Slice` use `sliceAsBytes` on little-endian for zero-copy.
-- **Throughput:** 3.9M rows/sec (256 bytes/row, uncompressed), 127K rows/sec with GZIP.
+
+**Measured throughput** (2M rows, 256 bytes/row, 4096 rows/group):
+
+| Mode | rows/sec | Payload MiB/s | File MiB/s | README Claim |
+|------|----------|---------------|------------|--------------|
+| Uncompressed | **4,914,119** | 1,200 | 1,219 | 3.9M (conservative) |
+| GZIP | **448,283** | 109 | 111 | 127K (very conservative) |
+| Optional (null_every=5) | **5,128,841** | 1,252 | 1,021 | not claimed |
+
+README claims were **conservative** -- actual performance is 1.26x (uncompressed) and 3.5x (GZIP) better than claimed.
 
 ---
 
-## parquet_flow_2 (Pure Zig + ZSTD, Zig 0.14+)
+## parquet_flow_2 (Pure Zig + ZSTD, Zig 0.16.0-dev.2510)
 
 ### Correctness
 
+**Build:** Compiles cleanly (requires `libzstd-dev`). **Tests FAIL** with integer overflow panic.
+
 **Parquet format:** Clean modular decomposition: `types.zig` -> `encoding.zig` -> `page_writer.zig` -> `column_writer.zig` -> `row_group_writer.zig` -> `file_writer.zig`. Thrift encoder implements compact protocol correctly including struct nesting.
 
-**Encoding:** All 8 physical types in PLAIN encoding. Boolean bit-packed LSB-first. Byte arrays length-prefixed with 4-byte LE u32. Fixed-length byte arrays raw-concatenated.
+**Parquet validation:** Output files are **valid** -- pyarrow reads all output files correctly:
+- `bench_1gb_UNCOMPRESSED.parquet`: 9M rows, 4 columns -- VALID
+- `bench_1gb_ZSTD.parquet`: 9M rows, ZSTD compression -- VALID
+- `market_UNCOMPRESSED.parquet`: 8M rows, 8 columns -- VALID
+- `market_ZSTD.parquet`: 8M rows, ZSTD compression -- VALID
+- Log sink files (1,308 files): all valid, ~74 rows each
 
-**Ring buffer (`log_sink.zig`):** SPSC ring buffer with power-of-2 masking. Correct memory ordering.
+**Encoding:** All 8 physical types in PLAIN encoding. Boolean bit-packed LSB-first. Byte arrays length-prefixed with 4-byte LE u32.
+
+**Ring buffer (`log_sink.zig`):** SPSC ring buffer with power-of-2 masking. Correct memory ordering. End-to-end pipeline works: 100K entries, 1,306 files produced, 0 dropped.
 
 **Issues:**
+- **Tests crash** with integer overflow panic (test runner timeout after 60s).
 - Entire file built in `ArrayList(u8)` before writing. For 9M rows of mixed data, that's ~1GB in RAM.
 - Ring buffer transport is specialized to `MarketOrder`/`LogEntry` structs, not generic.
 
@@ -69,26 +98,41 @@ Two well-designed C APIs:
 
 **Weakness:** C header omits `INT96` and `FIXED_LEN_BYTE_ARRAY` from `PfColumnType` enum, so those types can't be used through the C API.
 
-### Performance
+### Performance (Verified)
 
-- **Compression:** ZSTD via `libzstd`. 6.6% ratio on mixed data, 5% on market orders.
+- **Compression:** ZSTD via `libzstd`. 6.7% ratio on mixed data (confirmed).
 - **MarketOrder struct:** 128-byte cache-friendly layout with explicit padding.
-- **Throughput:** 9M rows/sec (mixed, uncompressed), 19M rows/sec (market orders, uncompressed), 10M rows/sec (ZSTD). Ring buffer: 190ns/push.
 - **Memory model:** Entire file in memory, single write at end.
+
+**Measured throughput:**
+
+| Benchmark | rows/sec | README Claim | Discrepancy |
+|-----------|----------|--------------|-------------|
+| 1GB mixed (uncompressed) | **3M** | 9M | **3x overstated** |
+| 1GB mixed (ZSTD) | **3M** | 10M | **3.3x overstated** |
+| Market orders (uncompressed) | **6M** | 19M | **3.2x overstated** |
+| Market orders (ZSTD) | **5M** | not separately claimed | -- |
+| Ring buffer push | **20,345 ns** | 190 ns | **107x overstated** |
+
+README claims are **significantly overstated**. The ring buffer latency claim (190ns vs actual 20,345ns) is off by two orders of magnitude. Throughput claims are 3x overstated across the board. The log sink produced 100K entries in 2,034ms with 1,306 output files.
 
 ---
 
-## parquet_flow_3 (Pure Zig, Zig 0.16-dev)
+## parquet_flow_3 (Pure Zig, Zig 0.16.0-dev.2510)
 
 ### Correctness
 
-**Parquet format:** Well-structured. Thrift implementation tested (3 inline tests). Schema builder handles all logical type annotations (STRING, TIMESTAMP, DECIMAL, UUID, etc.) -- the most complete logical type support of the three.
+**Build:** Compiles cleanly. **Tests FAIL** with integer overflow panic.
 
-**Ring buffer (`ring_buffer.zig`):** Most rigorous. Explicit 64-byte cache-line padding with `align(CACHE_LINE)`. Compile-time power-of-2 enforcement. `drainBatch()` for bulk reads. 13 tests including concurrent SPSC stress tests.
+**Parquet format:** Well-structured Thrift implementation with 3 inline tests. Schema builder handles all logical type annotations (STRING, TIMESTAMP, DECIMAL, UUID, etc.) -- the most complete logical type support of the three.
 
-**Writer (`writer.zig`):** FileWriter -> RowGroupWriter -> ColumnWriter hierarchy. Type-specific write methods. Definition levels with RLE/Bit-Pack Hybrid. Two tests verify file structure and optional columns.
+**Parquet validation: OUTPUT IS INVALID.** The market_data_example writes a 52MB file with correct PAR1 header/footer magic bytes, but **pyarrow cannot read it** -- Thrift deserialization fails with "TProtocolException: Invalid data". Despite having the most extensive schema support, the implementation produces non-standard Parquet metadata that conforming readers reject.
+
+**Ring buffer (`ring_buffer.zig`):** Most rigorous design (64-byte cache-line padding, compile-time power-of-2 enforcement, `drainBatch()` for bulk reads). However, tests crash.
 
 **Critical issues:**
+- **Output files are not valid Parquet.** The Thrift metadata is malformed -- pyarrow rejects them.
+- **Tests crash** with integer overflow panic.
 - **All compression is stubbed.** Only UNCOMPRESSED works.
 - **`flushBatch()` is a no-op.** It resets the batch without writing Parquet. The ring buffer pipeline works, but never produces output files.
 - BYTE_ARRAY columns are treated as fixed-size in the batch accumulator, which is a design mismatch with Parquet's variable-length semantics.
@@ -100,20 +144,29 @@ Simplest C API: `pqflow_create`, `pqflow_set_schema`, `pqflow_log`, `pqflow_flus
 
 **Weakness:** Only streaming sink (no batch writer). `pqflow_flush()` is a no-op. No way to write structured columnar data through the C API.
 
-### Performance
+### Performance (Verified)
 
 - **Compression:** None functional.
-- **Ring buffer:** Best engineering (cache-line alignment, compile-time enforcement, batch drain).
-- **Throughput:** 2M records/sec for the writer benchmark. No ring buffer end-to-end numbers.
-- **Documentation:** 776-line ARCHITECTURE.md, 25 tests.
+- **Ring buffer:** Best engineering design (cache-line alignment, compile-time enforcement, batch drain) but tests crash.
+
+**Measured throughput** (market_data_example, 1M rows):
+
+| Mode | rows/sec | README Claim | Note |
+|------|----------|--------------|------|
+| Writer (uncompressed) | **5,497,945** | 2M | 2.75x better than claimed |
+
+However, this throughput number is **meaningless** because the output file is invalid Parquet. Writing fast but producing corrupt output does not satisfy the requirements.
 
 ---
 
-## Comparative Summary
+## Comparative Summary (Verified)
 
 | Feature | pf_1 | pf_2 | pf_3 |
 |---------|------|------|------|
-| **All 8 physical types** | Yes | Yes | Yes |
+| **Compiles** | Yes | Yes (needs libzstd) | Yes |
+| **Tests pass** | **Yes** | No (integer overflow) | No (integer overflow) |
+| **Output valid Parquet** | **Yes** | **Yes** | **No** (Thrift error) |
+| **All 8 physical types** | Yes | Yes | Yes (but output invalid) |
 | **REPEATED fields** | Yes | No | No |
 | **Logical type annotations** | No | ConvertedType only | Full LogicalType union |
 | **Compression (working)** | GZIP | ZSTD | None (stubs) |
@@ -121,15 +174,18 @@ Simplest C API: `pqflow_create`, `pqflow_set_schema`, `pqflow_log`, `pqflow_flus
 | **Ring buffer -> Parquet wired** | Yes | Yes | No (no-op) |
 | **C API: batch writer** | Yes (level-aware) | Yes (columnar) | No |
 | **C API: streaming sink** | No (Zig only) | Yes | Yes (incomplete) |
-| **Throughput (uncompressed)** | 3.9M rows/s | 9-19M rows/s | 2M rows/s |
-| **Test suite** | Via parzig | Inline tests | 25 tests (most thorough) |
-| **Documentation** | Basic | Good | Excellent |
-| **Zig version** | 0.13 | 0.14+ | 0.16-dev |
+| **Verified throughput** | **4.9M rows/s** | **3-6M rows/s** | 5.5M rows/s (invalid output) |
+| **README accuracy** | Conservative | **3-107x overstated** | Conservative |
+| **Zig version** | 0.16.0-dev.2490 | 0.16.0-dev.2510 | 0.16.0-dev.2510 |
 
-### Verdict
+### Verdict (Updated with Verified Results)
 
-- **pf_1** is the most **production-complete**: streaming I/O, working GZIP, level-aware C API, end-to-end pipeline wired. Main limitation: log sink only streams opaque blobs, parzig dependency locks to Zig 0.13.
+- **pf_1** is the **only production-ready implementation**. It is the only one where tests pass, output validates with pyarrow, and the end-to-end pipeline (ring buffer -> parquet) works. Streaming I/O, working GZIP compression, level-aware C API. Its README performance claims were conservative (actual numbers are better). Main limitation: log sink only streams opaque blobs.
 
-- **pf_2** has the **best raw performance** and **most practical C API** (batch + streaming). ZSTD with 5-6% ratios. In-memory file model is the main concern for very large datasets.
+- **pf_2** produces **valid Parquet files** and has the most practical C API (batch + streaming), but its **tests crash** and its **README performance claims are grossly inflated** (3x on throughput, 107x on ring buffer latency). The ZSTD compression works correctly. The in-memory file model limits dataset size.
 
-- **pf_3** has the **best engineering rigor** (cache-line ring buffer, 25 tests, 776-line architecture doc, full logical types) but is **functionally incomplete** -- no compression, ring-to-parquet pipeline not wired.
+- **pf_3** is **functionally broken** despite having the best engineering rigor on paper. Its output files **cannot be read by pyarrow** -- the Thrift metadata is malformed. Tests crash. Compression is stubbed. The ring-to-parquet pipeline is a no-op. The 776-line architecture doc and 25 tests describe aspirational design, not working software.
+
+### Bottom Line
+
+Only pf_1 produces valid output from a passing test suite. If you need a working Parquet writer today, pf_1 is the only viable choice. pf_2 could be salvaged (the core Parquet encoding works, as validated by pyarrow) but needs test fixes and honest benchmarking. pf_3 needs fundamental correctness work before performance or API discussions are meaningful.
